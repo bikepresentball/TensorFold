@@ -7,6 +7,7 @@ const dspark = @import("dspark.zig");
 const prompt = @import("prompt.zig");
 const target_ = @import("target.zig");
 const pass_ = @import("pass.zig");
+const early_ = @import("early.zig");
 const pipelines = @import("pipelines.zig");
 
 const serve_lanes = host.serve_lanes;
@@ -32,6 +33,8 @@ pub const Options = struct {
     drafts: bool = true,
     cache_bytes: u64 = 0,
     prompt: prompt.Opts = .{},
+    /// greedy windows' next passes queued behind them (the lanes' speculative pass, on unless TF_DSV41_SPEC_DRAFT=0)
+    early: bool = true,
 };
 
 /// A position's draft candidates the pass keeps (the shape the lanes size their buffers by).
@@ -44,6 +47,7 @@ pub const Metal = struct {
     t: *target_.Target,
     dp: ?*dspark.Pass = null,
     ad: pass_.Pass = undefined,
+    early: ?*early_.Early = null,
 
     pub fn open(a: Allocator, parts: Parts, opt: Options) !*Metal {
         const m = try a.create(Metal);
@@ -54,7 +58,11 @@ pub const Metal = struct {
         const e = parts.env;
         if (opt.drafts) if (parts.dspark) |w| {
             m.dp = try dspark.Pass.init(a, e.device, e.queue, e.c, e.p, e.s, e.tables, parts.top, w, .{ .slots = opt.slots, .candidates = @min(candidates, e.c.vocab) });
+            errdefer m.dp.?.deinit();
             m.ad = .{ .x = m.dp.?, .t = m.t };
+            if (opt.early) m.early = try early_.Early.init(a, m.dp.?);
+            m.ad.early = m.early;
+            m.t.behind = m.ad.behind();
         };
         return m;
     }
@@ -75,6 +83,7 @@ pub const Metal = struct {
             .target = targetFn,
             .pass = passFn,
             .calibrate = calibrate,
+            .spec_default = m.early != null,
             .memory = .{ .ctx = m, .read = memory },
             .health = .{ .ctx = m, .read = healthy },
             .close = close,
@@ -113,6 +122,12 @@ pub const Metal = struct {
 
     fn close(ctx: *anyopaque) void {
         const m = self(ctx);
+        if (m.early) |e| {
+            var buf: [160]u8 = undefined;
+            std.log.info("dsv41 metal: {s}", .{e.describe(&buf)});
+            e.deinit();
+        }
+        m.t.behind = null;
         if (m.dp) |p| p.deinit();
         m.t.deinit();
         if (m.parts.owner) |o| o.close(o.ctx);

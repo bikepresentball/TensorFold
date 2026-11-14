@@ -39,6 +39,13 @@ pub const Options = struct {
     cache_bytes: u64 = 0,
 };
 
+/// The drafter's work behind a window: `queue` right after its command buffers, `drain` before the target writes.
+pub const Behind = struct {
+    ctx: *anyopaque,
+    queue: *const fn (ctx: *anyopaque, group: []const iface.Segment, logits: mtl.Buffer, off: usize, taps: mtl.Buffer) void,
+    drain: *const fn (ctx: *anyopaque) anyerror!void,
+};
+
 /// What the target did, for the tests and the logs.
 pub const Stats = struct { prompts: u64 = 0, hits: u64 = 0, cached_rows: u64 = 0, windows: u64 = 0, rows: u64 = 0, rewinds: u64 = 0, launches: u64 = 0, history_rows: u64 = 0 };
 
@@ -80,6 +87,8 @@ pub const Target = struct {
     /// sampled picks' float64 logits (picks.rows rows) and the ids 0 .. vocab - 1, kept between picks
     pick_vals: []f64 = &.{},
     pick_ids: []u64 = &.{},
+    /// the drafter's work behind a window (null: none)
+    behind: ?Behind = null,
 
     pub fn init(a: Allocator, env: Env, opt: Options) !*Target {
         const c = env.c;
@@ -156,6 +165,11 @@ pub const Target = struct {
         return @ptrCast(@alignCast(ptr));
     }
 
+    /// The drafter's queued work done before the target writes what it reads.
+    fn drainBehind(t: *Target) !void {
+        if (t.behind) |b| try b.drain(b.ctx);
+    }
+
     /// The device buffer and offset of an address a `taps` named (the pass's ingest reads it there).
     pub fn bufferOf(t: *const Target, address: u64) ?struct { buf: mtl.Buffer, off: usize } {
         for (t.slots) |s| {
@@ -178,6 +192,7 @@ pub const Target = struct {
     fn prefill(ptr: *anyopaque, slot: u32, ids: []const u32, smp: ?lanes.Sampling, draw: u64) anyerror!u32 {
         const t = self(ptr);
         if (slot >= t.slots.len) return error.NoSlot;
+        try t.drainBehind();
         const s = &t.slots[slot];
         const c = t.env.c;
         if (s.live) return error.SlotLive;
@@ -300,6 +315,7 @@ pub const Target = struct {
     /// A round's windows: slots' rows share a launch (up to R rows, a slot once), each launch one forward.
     fn window(ptr: *anyopaque, segments: []const iface.Segment, choices: [][]u32) anyerror!void {
         const t = self(ptr);
+        try t.drainBehind();
         var from: usize = 0;
         while (from < segments.len) {
             var rows: usize = 0;
@@ -406,19 +422,27 @@ pub const Target = struct {
         const x: ctx_.Ctx = .{ .c = c, .p = e.p, .s = e.s, .slot = segs[0].slot, .tables = e.tables, .p0 = segs[0].p0, .rows = r0, .segs = segs[0..group.len] };
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
-        var hook: Hook = .{ .t = t, .pieces = pieces[0..group.len], .look_up = look_up };
-        try forward.runWith(&x, e.queue, e.model, &t.b, .{ .ctx = &hook, .rows = if (look_up != null) Hook.rows else null });
+        var hook: Hook = .{ .t = t, .group = group, .pieces = pieces[0..group.len], .look_up = look_up };
+        try forward.runWith(&x, e.queue, e.model, &t.b, .{ .ctx = &hook, .rows = if (look_up != null) Hook.rows else null, .then = if (t.behind != null) Hook.then else null });
     }
 
-    /// A launch's hook: each Engram layer's rows before the command buffer that reads them.
+    /// A launch's hooks: each Engram layer's rows before the command buffer that reads them, the drafter's chain after.
     const Hook = struct {
         t: *Target,
+        group: []const iface.Segment,
         pieces: []const forward.Piece,
         look_up: ?forward.Lookup,
 
         fn rows(ctx: *anyopaque, li: usize) anyerror!void {
             const h: *Hook = @ptrCast(@alignCast(ctx));
             try forward.fillRows(&h.t.b, h.t.env.c, h.pieces, h.look_up.?, li);
+        }
+
+        fn then(ctx: *anyopaque) void {
+            const h: *Hook = @ptrCast(@alignCast(ctx));
+            const b = h.t.behind.?;
+            const tb = h.t.slots[h.group[0].slot].kv.taps orelse return;
+            b.queue(b.ctx, h.group, h.t.b.logits.buf, h.t.b.logits.off, tb);
         }
     };
 
@@ -453,6 +477,8 @@ pub const Target = struct {
     fn history(ptr: *anyopaque, slot: u32, start: u64, rows: u32) ?iface.Taps {
         const t = self(ptr);
         if (slot >= t.slots.len) return null;
+        // the rows land in the prompt-taps buffer a queued ingest may still read
+        t.drainBehind() catch return null;
         const s = &t.slots[slot];
         const c = t.env.c;
         const w = tapWidth(c);
