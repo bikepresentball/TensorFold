@@ -29,6 +29,7 @@ pub const snapshots = @import("snapshots.zig");
 pub const target = @import("target.zig");
 pub const pass = @import("pass.zig");
 pub const early = @import("early.zig");
+pub const early_picks = @import("early_picks.zig");
 pub const picks = @import("picks.zig");
 pub const serve = @import("serve.zig");
 pub const boot = @import("boot.zig");
