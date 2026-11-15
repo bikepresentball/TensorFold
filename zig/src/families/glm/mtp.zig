@@ -65,12 +65,14 @@ pub fn finish(x: *fwd.Ctx, e: mtl.ComputeEncoder, res: Ref, normed: Ref, rows: u
     add(x, e, sc.m_out, sc.branch, sc.m_x, rows * D);
 }
 
-/// Drafts for `rows` pre-norm head outputs at `out`: the head's norm, then the LM head over the draft vocabulary.
+/// Drafts for `rows` head outputs at `out`: its norm, the LM head over the draft vocabulary, each row's draft_draws.
 pub fn drafts(x: *const fwd.Ctx, e: mtl.ComputeEncoder, out: Ref, rows: u32, picks: Ref) void {
     const c = x.c;
     const D = c.hidden;
     fwd.rms(x, e, out, x.w.mtp.?.norm, x.sc.m_hn, rows, D, D, D, c.eps);
-    fwd.headOver(x, e, x.sc.m_hn, x.sc.m_logits.at(@as(usize, x.m_row) * c.vocab * 2), picks, rows, x.draft_vocab, true);
+    var y = x.*;
+    y.draws = x.draft_draws;
+    fwd.headOver(&y, e, x.sc.m_hn, x.sc.m_logits.at(@as(usize, x.m_row) * c.vocab * 2), picks, rows, x.draft_vocab, x.draft_draws == null);
 }
 
 /// One chained draft from `h` (a row of the head's previous output, m_x) and the draft before it (`token`, u32).

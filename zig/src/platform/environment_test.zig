@@ -93,6 +93,8 @@ const valid = [_]Case{
     .{ .name = "TF_FLASHNEXT_SCALE_INDEX", .raw = "1", .n = 1 },
     .{ .name = "GLM_EHPROJ_NAX", .raw = "0", .n = 0 },
     .{ .name = "GLM_EHPROJ_NAX", .raw = "1", .n = 1 },
+    .{ .name = "TF_GLM_KEYED_DRAFTS", .raw = "0", .n = 0 },
+    .{ .name = "TF_GLM_KEYED_DRAFTS", .raw = "1", .n = 1 },
     .{ .name = "XPU_A8_BITS", .raw = "4", .n = 4 },
     .{ .name = "XPU_A8_BITS", .raw = "8", .n = 8 },
     .{ .name = "LFM3_FUSE", .raw = "7", .n = 7 },

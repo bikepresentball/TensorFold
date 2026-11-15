@@ -2,6 +2,10 @@
 
 Each release's page on GitHub has its notes and measurements. See [the 1.0.0 release notes](RELEASE-NOTES-1.0.0.md) for the native binary's supported models and migration details.
 
+## Unreleased
+
+- GLM-5.3-Flash on Metal: a sampled stream's MTP drafts are now drawn with the stream's own keyed rule, at half its temperature, at the position each draft fills, instead of the head's argmax (`TF_GLM_KEYED_DRAFTS=0` restores the argmax). The target's keyed draw still decides every token, so replies are unchanged. On an M5 Ultra (two runs each), sampled decode over the 16 bench prompts rose from 84.3 to 87.2 tok/s and on prose from 77.1 to 78.4; greedy and draft-free decode are unchanged, and all 48 replies are equal.
+
 ## 1.2.9
 
 - Tests: the sessions writes test on real files does the same coverage with 40 requests at half the token sizes, so it no longer times out on busy CI runners (#3347).
