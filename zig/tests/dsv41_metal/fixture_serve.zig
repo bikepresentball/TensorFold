@@ -34,8 +34,8 @@ const Held = struct {
     }
 };
 
-/// `block`: the drafts a pass makes in place of the drafter's config (TF_DSV41_DSPARK_BLOCK's override).
-pub const Opts = struct { slots: u32 = 4, drafts: bool = true, cache_bytes: u64 = 0, chunk: u32 = 64, early: bool = true, block: ?u32 = null };
+/// `block`, `rank`: the drafter's in place of its config's; `gpu_chain`: greedy chains on the GPU (whole vocabulary).
+pub const Opts = struct { slots: u32 = 4, drafts: bool = true, cache_bytes: u64 = 0, chunk: u32 = 64, early: bool = true, block: ?u32 = null, rank: ?u32 = null, gpu_chain: bool = false };
 
 /// The tiny model from `seed` served on this GPU; the returned model owns the rig (closed with it).
 pub fn open(a: std.mem.Allocator, io: std.Io, seed: u64, o: Opts) !*pkg.serve.Metal {
@@ -44,6 +44,7 @@ pub fn open(a: std.mem.Allocator, io: std.Io, seed: u64, o: Opts) !*pkg.serve.Me
     h.a = a;
     var cfg = config();
     if (o.block) |b| cfg.dspark_block = b;
+    if (o.rank) |k| cfg.dspark_markov_rank = k;
     h.f = try ff.Fwd.initWith(a, io, cfg, limit, seed);
     errdefer h.f.deinit();
     const r = h.f.r;
@@ -62,7 +63,7 @@ pub fn open(a: std.mem.Allocator, io: std.Io, seed: u64, o: Opts) !*pkg.serve.Me
     errdefer h.w.deinit();
     const env: pkg.target.Env = .{ .device = r.device, .queue = r.queue, .c = &r.c, .p = &r.p, .tables = &r.tables, .s = &r.s, .model = h.f.model(), .lookup = h.f.lookup() };
     const parts: pkg.serve.Parts = .{ .env = env, .top = &r.top.?, .dspark = &h.w, .owner = .{ .ctx = h, .close = Held.close } };
-    return pkg.serve.Metal.open(a, parts, .{ .slots = o.slots, .limit = limit, .drafts = o.drafts, .cache_bytes = o.cache_bytes, .prompt = .{ .chunk = o.chunk }, .early = o.early });
+    return pkg.serve.Metal.open(a, parts, .{ .slots = o.slots, .limit = limit, .drafts = o.drafts, .cache_bytes = o.cache_bytes, .prompt = .{ .chunk = o.chunk }, .early = o.early, .gpu_chain = o.gpu_chain });
 }
 
 /// Closes a model `open` made (the served engine closes its own through serve_lanes).
