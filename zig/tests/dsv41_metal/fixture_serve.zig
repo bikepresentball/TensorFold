@@ -34,14 +34,17 @@ const Held = struct {
     }
 };
 
-pub const Opts = struct { slots: u32 = 4, drafts: bool = true, cache_bytes: u64 = 0, chunk: u32 = 64, early: bool = true };
+/// `block`: the drafts a pass makes in place of the drafter's config (TF_DSV41_DSPARK_BLOCK's override).
+pub const Opts = struct { slots: u32 = 4, drafts: bool = true, cache_bytes: u64 = 0, chunk: u32 = 64, early: bool = true, block: ?u32 = null };
 
 /// The tiny model from `seed` served on this GPU; the returned model owns the rig (closed with it).
 pub fn open(a: std.mem.Allocator, io: std.Io, seed: u64, o: Opts) !*pkg.serve.Metal {
     const h = try a.create(Held);
     errdefer a.destroy(h);
     h.a = a;
-    h.f = try ff.Fwd.initWith(a, io, config(), limit, seed);
+    var cfg = config();
+    if (o.block) |b| cfg.dspark_block = b;
+    h.f = try ff.Fwd.initWith(a, io, cfg, limit, seed);
     errdefer h.f.deinit();
     const r = h.f.r;
     {
