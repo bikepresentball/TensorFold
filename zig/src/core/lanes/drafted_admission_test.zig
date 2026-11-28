@@ -186,11 +186,7 @@ test "a drafted newcomer is refused beside a live undrafted stream; the incumben
     try std.testing.expectEqualSlices(u32, plain.tokens[0], c.emitted()); // drafted equals one-token decode
 }
 
-// Maintainer ask 1 (PR 5102 FINISH leg F1): with --drafter armed (the one-stream fact live) the
-// target's shared window rides one segment, so two drafting-disabled requests both admitted was a
-// post-admission verification failure - the older cell let that pair serve. The refusal now stands
-// at the same admission seam as the mixtures: the second undrafted request fails whole before any
-// target work, the incumbent byte-identical to its solo run, recovery admitted after it ends.
+// Maintainer ask 1 (PR 5102 leg F1): refuse the second undrafted request at admission; incumbent byte-identical.
 test "a second undrafted request is refused before target work under a one_stream drafter" {
     const solo = try fixture.run(&.{.{ .prompt = &fixture.p1, .drafts = false }}, .plain, false);
     defer fixture.freeOut(solo);
