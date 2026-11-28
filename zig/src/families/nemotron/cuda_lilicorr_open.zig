@@ -98,18 +98,19 @@ pub fn openStream(d: *Draft, s: *Stream) !void {
     const ctx = d.pool.pop() orelse try create(
         d,
     );
+    errdefer d.pool.append(d.gpa, ctx) catch drop(d, ctx); // maintainer ask 8: the guard installs first - a failing reset, not just a failing map put, returns the owner to the pool
+
     // The owner A4 cure: a POOLED context re-opens through the same resetStream create()
 
     // uses — without this line the reuse path kept the prior stream's ring bytes, begin/end,
 
     // held drafts and anchor gate (the fresh-open state create() gives, lost).
     try resetStream(ctx);
-    // The map put keeps ownership: on its failure the LIVE context returns to the pool, and
+    // The map put runs under the same guard: on its failure the LIVE context returns to the
 
-    // only a pool append that ITSELF fails (gpa exhausted) actually drops it. The old shape
+    // pool, and only a pool append that ITSELF fails (gpa exhausted) actually drops it. The old
 
-    // destroyed the context first and then pooled the freed pointer — a use-after-free.
-    errdefer d.pool.append(d.gpa, ctx) catch drop(d, ctx);
+    // shape destroyed the context first and then pooled the freed pointer — a use-after-free.
     try d.streams.put(d.gpa, s, ctx);
 }
 

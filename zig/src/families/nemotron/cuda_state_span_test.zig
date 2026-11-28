@@ -16,15 +16,20 @@ const Set = struct {
     var n: usize = 0;
     var val: u8 = 0;
     var fires: usize = 0;
+    var fail_at: ?usize = null; // the (1-based) first fire that refuses, so create()'s own reset can pass
 
     fn arm() void {
         dst = 0;
         n = 0;
         val = 0;
         fires = 0;
+        fail_at = null;
     }
 
     fn record(d: cuda.abi.DevicePtr, v: u8, count: usize) cuda.abi.Result {
+        if (fail_at) |k| {
+            if (fires + 1 == k) return cuda.abi.error_not_ready;
+        }
         dst = d;
         n = count;
         val = v;
@@ -53,6 +58,15 @@ const Fake = struct {
     fn launchEx(_: *const cuda.abi.LaunchConfig, _: cuda.abi.Function, _: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
         return cuda.abi.success;
     }
+
+    fn memAlloc(p: *cuda.abi.DevicePtr, _: usize) callconv(.c) cuda.abi.Result {
+        p.* = 0x8c000000;
+        return cuda.abi.success;
+    }
+
+    fn memFree(_: cuda.abi.DevicePtr) callconv(.c) cuda.abi.Result {
+        return cuda.abi.success;
+    }
 };
 
 /// The absorb-guard rig's fake faces plus a memset recorder, so a reset's ring re-fill grades as an executed call.
@@ -73,6 +87,8 @@ const Rig = struct {
         self.driver.api.cuMemcpyDtoHAsync_v2 = Fake.memcpyH;
         self.driver.api.cuMemsetD8_v2 = Set.memset;
         self.driver.api.cuMemsetD8Async = Set.memsetAsync;
+        self.driver.api.cuMemAlloc_v2 = Fake.memAlloc; // the fresh-context arm creates a ring through the fakes
+        self.driver.api.cuMemFree_v2 = Fake.memFree;
         self.ctx_dev = .{ .d = &self.driver, .device = 0, .handle = null };
         e.ctx = &self.ctx_dev;
         e.stream = .{ .d = &self.driver, .handle = null };
@@ -280,4 +296,49 @@ test "no prompt-length literal survives in the span or row-0 rule (owner A5, str
     // ONE reset, BOTH open paths: the decl plus the create() and openStream() call sites
     const open_src = @embedFile("cuda_lilicorr_open.zig");
     try t.expectEqual(@as(usize, 3), std.mem.count(u8, open_src, "resetStream("));
+}
+
+// -- maintainer ask 8: the ownership guard installs BEFORE the acquired context is reset --
+
+test "a failing reset on a POOLED context leaves the owner in the pool (PR 5102 ask 8)" {
+    const t = std.testing;
+    var rig: Rig = .{};
+    const d = rig.arm();
+    defer d.pool.deinit(d.gpa);
+    defer d.streams.deinit(d.gpa);
+    const ring = rig.ring_buf;
+    var used: lc.Ctx = .{ .ring = ring };
+    used.end = 200;
+    try d.pool.append(d.gpa, &used);
+    var s: Stream = undefined;
+
+    Set.arm();
+    Set.fail_at = 1; // fire #1 is openStream's own resetStream (the pop skips create())
+    try t.expectError(error.NotReady, openz.openStream(d, &s)); // the reset itself refuses
+    Set.fail_at = null;
+    try t.expectEqual(@as(usize, 1), d.pool.items.len); // the guard was ALREADY installed: the owner returns
+    try t.expect(d.pool.items[0] == &used); // the very same pooled context, not a wrecked fresh one
+    try t.expect(d.streams.get(&s) == null); // the open failed: no stream was ever installed
+
+    // recovery: the same acquisition succeeds once the device cooperates
+    try openz.openStream(d, &s);
+    try t.expect(d.streams.get(&s) == &used);
+}
+
+test "a failing reset on a FRESH context returns it to the pool, not into the void (PR 5102 ask 8)" {
+    const t = std.testing;
+    var rig: Rig = .{};
+    const d = rig.arm();
+    defer d.pool.deinit(d.gpa);
+    defer d.streams.deinit(d.gpa);
+    var s: Stream = undefined;
+
+    Set.arm();
+    Set.fail_at = 2; // fire #1 is create()'s internal reset; fire #2 is openStream's reset
+    try t.expectError(error.NotReady, openz.openStream(d, &s)); // the acquisition ran, the reset refused
+    Set.fail_at = null;
+    try t.expectEqual(@as(usize, 1), d.pool.items.len); // the fresh context has an owner: the pool
+    try openz.openStream(d, &s); // recovery re-opens out of the pooled context
+    try t.expect(d.streams.get(&s) != null);
+    if (d.streams.fetchRemove(&s)) |kv| openz.drop(d, kv.value); // the rig hands the created context back
 }
