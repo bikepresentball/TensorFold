@@ -470,34 +470,7 @@ test "the absorb keep never underflows a narrow ring and the trim keeps the list
     const ring_buf: cuda.DeviceBuffer = .{ .d = &driver, .ptr = 0x5a000000, .len = 1 << 24 };
     const rows_h = @intFromPtr(d.fns.gather_rows.handle.?);
 
-    // CELL A (narrow-window): ring truth - the window keeps working on rings that cannot spare the
-    // reserve, and every accepted window is underflow-free.
-    {
-        d.c.window = 64; // an accepted window (16..2048); its 64+16-row ring cannot spare the 256 reserve
-        d.tap_rows = 80;
-        g.reset();
-        var ctx_s: lc.Ctx = .{ .ring = ring_buf };
-        var absorb_err: ?anyerror = null;
-        guard_absorb.absorbRows(&d, &ctx_s, 0x6a000000, 1234, 100, null, true) catch |err| {
-            absorb_err = err;
-        };
-        try t.expect(absorb_err == null); // the cure: keep = min(64, 64+16) = 64 - no wrap, the window works
-        var gathers_a: usize = 0;
-        const taps_h = @intFromPtr(d.fns.gather_taps.handle.?);
-        for (0..g.count) |i| {
-            if (@intFromPtr(g.f_handle[i].?) == taps_h) {
-                gathers_a += 1;
-                try t.expectEqual(@as(usize, 64), g.f_grid[i]); // the kept rows only, in one staging chunk
-                try t.expectEqual(@as(i32, 80), g.f_tapn[i]); // the ring's rows ride the launch
-                try t.expectEqual(@as(i64, 1234 + 36), g.f_start[i]); // the trim's 36-row advance
-            }
-        }
-        try t.expectEqual(@as(usize, 1), gathers_a);
-        try t.expect(ctx_s.begin == 1270 and ctx_s.end == 1334); // head 36 drop; the pass ends at +64
-    }
-
-    // CELL B (trimmed-permuted): the trim keeps THE RING'S newest `keep` rows - on an unordered list
-    // the entries at or past the drop, rebased - never the list's own head or tail slice.
+    // CELL B (trimmed-permuted): the trim keeps the newest rows by RING TRUTH - the entries past the drop, rebased
     {
         d.c.window = 256; // keep = min(256, 272 - 256) = 16: a 256-row batch trims 240, no wrap either tree
         d.tap_rows = 272;
@@ -534,5 +507,29 @@ test "the absorb keep never underflows a narrow ring and the trim keeps the list
             }
         }
         try t.expectEqual(@as(usize, 1), gathers);
+    }
+    // CELL A (narrow-window): ring truth - the window keeps working on rings that cannot spare the reserve
+    {
+        d.c.window = 64; // an accepted window (16..2048); its 64+16-row ring cannot spare the 256 reserve
+        d.tap_rows = 80;
+        g.reset();
+        var ctx_s: lc.Ctx = .{ .ring = ring_buf };
+        var absorb_err: ?anyerror = null;
+        guard_absorb.absorbRows(&d, &ctx_s, 0x6a000000, 1234, 100, null, true) catch |err| {
+            absorb_err = err;
+        };
+        try t.expect(absorb_err == null); // the cure: keep = min(64, 64+16) = 64 - no wrap, the window works
+        var gathers_a: usize = 0;
+        const taps_h = @intFromPtr(d.fns.gather_taps.handle.?);
+        for (0..g.count) |i| {
+            if (@intFromPtr(g.f_handle[i].?) == taps_h) {
+                gathers_a += 1;
+                try t.expectEqual(@as(usize, 64), g.f_grid[i]); // the kept rows only, in one staging chunk
+                try t.expectEqual(@as(i32, 80), g.f_tapn[i]); // the ring's rows ride the launch
+                try t.expectEqual(@as(i64, 1234 + 36), g.f_start[i]); // the trim's 36-row advance
+            }
+        }
+        try t.expectEqual(@as(usize, 1), gathers_a);
+        try t.expect(ctx_s.begin == 1270 and ctx_s.end == 1334); // head 36 drop; the pass ends at +64
     }
 }
