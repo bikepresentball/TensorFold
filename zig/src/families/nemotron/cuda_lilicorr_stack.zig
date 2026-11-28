@@ -14,6 +14,7 @@ pub fn readFixtureF32(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, name:
     const path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir, name });
     defer gpa.free(path);
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 30));
+    defer gpa.free(bytes); // maintainer ask 3: the reader frees its own raw blob - retention lived here too
     if (bytes.len != n * 4) return error.FixtureBlobSize;
     const out = try gpa.alloc(f32, n);
     @memcpy(out, @as([*]align(1) const f32, @ptrCast(bytes.ptr))[0..n]);
@@ -38,10 +39,19 @@ pub fn deviceLayerStackAB(gpa: std.mem.Allocator, io: std.Io, d: *Draft, fix_dir
     const hd = head.hd;
 
     const h_pre = try readFixtureF32(io, gpa, fix_dir, "h_pre.f32", rows * hd);
+    defer gpa.free(h_pre); // maintainer ask 3: the fixture ladder frees every host buffer it reads
+
     const layer1 = try readFixtureF32(io, gpa, fix_dir, "layer1.f32", rows * hd);
+    defer gpa.free(layer1); // maintainer ask 3: the fixture ladder frees every host buffer it reads
+
     const layer2 = try readFixtureF32(io, gpa, fix_dir, "layer2.f32", rows * hd);
+    defer gpa.free(layer2); // maintainer ask 3: the fixture ladder frees every host buffer it reads
+
     const qkv_gold = try readFixtureF32(io, gpa, fix_dir, "qkv1_pre.f32", rows * 3 * hd);
+    defer gpa.free(qkv_gold); // maintainer ask 3: the fixture ladder frees every host buffer it reads
+
     const attn_gold = try readFixtureF32(io, gpa, fix_dir, "attn1_raw.f32", rows * hd);
+    defer gpa.free(attn_gold); // maintainer ask 3: the fixture ladder frees every host buffer it reads
 
     const h_pre_bits = try gpa.alloc(u16, rows * hd);
     defer gpa.free(h_pre_bits);

@@ -257,11 +257,22 @@ pub fn deviceFullChainAB(gpa: std.mem.Allocator, io: std.Io, d: *Draft, fix_dir:
     const n_pair = (slots - 1) * topk * topk;
 
     const token_emb = try readFixtureF32(io, gpa, fix_dir, "token_embeddings.f32", rows * head.model_hidden);
+    defer gpa.free(token_emb); // maintainer ask 3: the fixture ladder frees every host buffer it reads
+
     const pass_hidden = try readFixtureF32(io, gpa, fix_dir, "pass_hidden.f32", head.model_hidden);
+    defer gpa.free(pass_hidden); // maintainer ask 3: the fixture ladder frees every host buffer it reads
+
     const anchor_hidden = try readFixtureF32(io, gpa, fix_dir, "anchor_hidden.f32", head.model_hidden);
+    defer gpa.free(anchor_hidden); // maintainer ask 3: the fixture ladder frees every host buffer it reads
+
     const log_probs = try readFixtureF32(io, gpa, fix_dir, "candidate_log_probs.f32", rows);
+    defer gpa.free(log_probs); // maintainer ask 3: the fixture ladder frees every host buffer it reads
+
     const start_gold = try readFixtureF32(io, gpa, fix_dir, "start_scores.f32", topk);
+    defer gpa.free(start_gold); // maintainer ask 3: the fixture ladder frees every host buffer it reads
+
     const pair_gold = try readFixtureF32(io, gpa, fix_dir, "pair_scores.f32", n_pair);
+    defer gpa.free(pair_gold); // maintainer ask 3: the fixture ladder frees every host buffer it reads
 
     // inputs as bf16 bits — the serve path's dtype (S2's round-trip pattern)
     const tok_bits = try gpa.alloc(u16, rows * head.model_hidden);

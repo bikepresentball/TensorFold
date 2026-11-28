@@ -5,6 +5,9 @@ const cuda = @import("cuda");
 const head = @import("cuda_lilicorr_head.zig");
 const devicez = @import("cuda_lilicorr_device.zig");
 const openz = @import("cuda_lilicorr_open.zig");
+const stagez = @import("cuda_lilicorr_stage.zig");
+const stackz = @import("cuda_lilicorr_stack.zig");
+const gatez = @import("cuda_lilicorr_bodygate.zig");
 const lc = @import("cuda_lilicorr.zig");
 const wts = @import("cuda_lilicorr_weights.zig");
 
@@ -81,6 +84,21 @@ const Fakes = struct {
 
     fn unload(_: cuda.abi.Module) callconv(.c) cuda.abi.Result {
         Rec.unload_calls += 1;
+        return cuda.abi.success;
+    }
+};
+
+/// The pinned-host recorder: stageDeviceScratch's staging and the pinned carve count through it.
+const HostMemo = struct {
+    var host_n: usize = 0;
+
+    fn hostAlloc(p: *?*anyopaque, _: usize, _: c_uint) callconv(.c) cuda.abi.Result {
+        p.* = @ptrFromInt(0x7d000000);
+        return cuda.abi.success;
+    }
+
+    fn hostFree(_: ?*anyopaque) callconv(.c) cuda.abi.Result {
+        host_n += 1;
         return cuda.abi.success;
     }
 };
@@ -211,6 +229,9 @@ test "normal close frees every owned byte once — body weights, staging arena, 
     const a = std.testing.allocator;
     var drv: cuda.Driver = undefined;
     armDriver(&drv);
+    drv.api.cuMemHostAlloc = HostMemo.hostAlloc;
+    drv.api.cuMemFreeHost = HostMemo.hostFree;
+    HostMemo.host_n = 0;
     Rec.reset();
     const base = cuda.memory.usage(false);
 
@@ -254,8 +275,12 @@ test "normal close frees every owned byte once — body weights, staging arena, 
     inline for (.{ "scratch_buf", "xs_buf", "pm_buf", "pl_buf", "po_buf", "ids_buf", "segments_buf", "cand_ids_buf", "cand_emb_buf", "anchor_buf", "token_states_buf", "draft_picks_buf" }) |name| {
         @field(d, name) = try cuda.DeviceBuffer.alloc(&drv, 16);
     }
+    d.staged = try cuda.HostBuffer.alloc(&drv, 1024); // the ask-3 surface: a pinned carve a close must return
 
     openz.deinit(&d); // the normal close: every owner surface hands back once
+
+    try std.testing.expectEqual(@as(usize, 1), HostMemo.host_n); // the pinned staging handed back exactly once (maintainer ask 3)
+    try std.testing.expectEqual(base.host, cuda.memory.usage(false).host); // its bytes left the usage ledger with it
 
     try std.testing.expectEqual(base.device, cuda.memory.usage(false).device); // bytes above and below every stage
     try std.testing.expectEqual(@as(usize, 15), Rec.free_n); // 12 scratch + ring + w.arena + dhw.arena
@@ -395,4 +420,86 @@ test "scorer result: a pair-alloc failure frees the first result allocation (own
         try t.expectEqual(head.topk, got.start.len);
         try t.expectEqual((head.slots - 1) * head.topk * head.topk, got.pair.len);
     }
+}
+
+fn putBlob(io: std.Io, a: std.mem.Allocator, tmp: *std.testing.TmpDir, n: usize, name: []const u8) !void {
+    const z = try a.alloc(u8, n);
+    defer a.free(z);
+    @memset(z, 0);
+    try tmp.dir.writeFile(io, .{ .sub_path = name, .data = z });
+}
+
+/// A dummy DeviceWeights: stageDeviceScratch only null-checks it, so zeros with a live arena suffice.
+fn dummyDeviceWeights(drv: *cuda.Driver, a: std.mem.Allocator) !devicez.DeviceWeights {
+    var w: devicez.DeviceWeights = undefined;
+    inline for (.{ "token_proj", "pass_proj", "ctx_proj", "feature_up", "feature_down", "factor", "out_head", "in_head", "anchor_out_head" }) |name| @field(w, name) = .{ .w = 0 };
+    inline for (.{ "feature_norm_w", "feature_norm_b", "slot_emb", "rank_emb", "out_norm", "anchor_norm", "rel_bias", "same_bias" }) |name| @field(w, name) = 0;
+    w.layers = try a.alloc(devicez.DeviceLayer, 1);
+    w.arena = try cuda.DeviceBuffer.alloc(drv, 8192);
+    return w;
+}
+
+test "opt-in device scratch: a failed upload frees the carve once and unmarks it (maintainer ask 3)" {
+    const a = std.testing.allocator;
+    var drv: cuda.Driver = undefined;
+    armDriver(&drv);
+    var ctx: cuda.Context = undefined;
+    ctx.d = &drv;
+    ctx.device = 0;
+    ctx.handle = null;
+    var e_dummy: lc.E = undefined;
+    e_dummy.ctx = &ctx;
+    var hw_arena = std.heap.ArenaAllocator.init(a);
+    defer hw_arena.deinit();
+    const dhw = try dummyDeviceWeights(&drv, a);
+    defer a.free(dhw.layers); // the rig owns the dummy's layers slice
+    Rec.reset();
+    const base = cuda.memory.usage(false);
+
+    var d: lc.Draft = undefined;
+    d.e = &e_dummy;
+    d.gpa = a;
+    d.hw = try fullHostWeights(hw_arena.allocator());
+    d.dhw = dhw;
+    Rec.fail_hto = 0; // the carve's first upload (the fused arm weights) refuses
+    const r = openz.stageDeviceScratch(&d);
+    try std.testing.expect(std.meta.isError(r));
+    try std.testing.expectEqual(@as(usize, 1), Rec.free_n); // the carve handed back exactly once
+    try Rec.expectOnce(base);
+    try std.testing.expect(!d.ds.staged); // the flag did not outlive its buffer (pre-cure it stayed true)
+}
+
+test "fixture ladders free their host buffers on a mid-read failure (maintainer ask 3)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var d_dummy: lc.Draft = undefined; // the second-read failure leaves before any device op or d deref
+
+    // each ladder's FIRST read finds its full-size blob; the SECOND read's file is absent
+    try putBlob(io, a, &tmp, 56 * 4096 * 4, "token_embeddings.f32");
+    try putBlob(io, a, &tmp, 56 * 3 * 1024 * 4, "qkv1_pre.f32");
+    try putBlob(io, a, &tmp, 56 * 1024 * 4, "out_normed.f32");
+    try putBlob(io, a, &tmp, 56 * 1024 * 4, "h_pre.f32");
+
+    // every helper dies at its SECOND read with the FIRST buffer alive; the allocator leak check is the verdict.
+    try std.testing.expectError(error.FileNotFound, stagez.deviceTokenStatesAB(a, io, &d_dummy, root));
+    try std.testing.expectError(error.FileNotFound, stagez.deviceLatticeAttentionAB(a, io, &d_dummy, root));
+    try std.testing.expectError(error.FileNotFound, stagez.deviceFactorEdgeAB(a, io, &d_dummy, root));
+    try std.testing.expectError(error.FileNotFound, stackz.deviceLayerStackAB(a, io, &d_dummy, root));
+    try std.testing.expectError(error.FileNotFound, gatez.deviceFullChainAB(a, io, &d_dummy, root));
+}
+
+test "the open hand-over defines the staged mark; the carve windows unmark on unwind (maintainer ask 3, structural)" {
+    const t = std.testing;
+    const src = @embedFile("cuda_lilicorr.zig");
+    const mark = std.mem.indexOf(u8, src, "d.open_stage = .none;") orelse std.math.maxInt(usize);
+    try t.expect(std.mem.indexOf(u8, src, "try attachWeights").? > mark); // defined BEFORE the early cleanup reads it
+    try t.expect(std.mem.indexOf(u8, src, "d.open_stage = .ring") != null); // the staged ladder still climbs
+    const open_src = @embedFile("cuda_lilicorr_open.zig");
+    try t.expectEqual(@as(usize, 2), std.mem.count(u8, open_src, "d.ds.staged = false;")); // the two carve windows both unmark on unwind
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, open_src, "d.ds.staged = true;")); // exactly the assignment beside the carve
+    try t.expect(std.mem.indexOf(u8, open_src, "d.staged.free();") != null); // the normal close hands the pinned staging back
 }

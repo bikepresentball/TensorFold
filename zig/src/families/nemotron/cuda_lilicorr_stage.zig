@@ -18,7 +18,11 @@ pub fn deviceTokenStatesAB(gpa: std.mem.Allocator, io: std.Io, d: *Draft, fix_di
     const in_dim = head.model_hidden;
     const out_dim = head.hd;
     const emb = try readFixtureF32(io, gpa, fix_dir, "token_embeddings.f32", rows * in_dim);
+    defer gpa.free(emb); // maintainer ask 3: the fixture ladder frees every host buffer it reads
+
     const gold = try readFixtureF32(io, gpa, fix_dir, "token_states.f32", rows * out_dim);
+    defer gpa.free(gold); // maintainer ask 3: the fixture ladder frees every host buffer it reads
+
     const emb_bits = try gpa.alloc(u16, rows * in_dim);
     defer gpa.free(emb_bits);
     for (emb, 0..) |x, i| emb_bits[i] = @truncate(@as(u32, @bitCast(nvfp4.bf16(x))) >> 16);
@@ -64,7 +68,10 @@ pub fn deviceLatticeAttentionAB(gpa: std.mem.Allocator, io: std.Io, d: *Draft, f
 
     // Read fixture data
     const qkv1_pre = try readFixtureF32(io, gpa, fix_dir, "qkv1_pre.f32", rows * 3 * in_dim);
+    defer gpa.free(qkv1_pre); // maintainer ask 3: the fixture ladder frees every host buffer it reads
+
     const attn1_raw = try readFixtureF32(io, gpa, fix_dir, "attn1_raw.f32", rows * out_dim);
+    defer gpa.free(attn1_raw); // maintainer ask 3: the fixture ladder frees every host buffer it reads
 
     // Build bias
     const bias = try head.buildBias(gpa, &d.hw);
@@ -122,11 +129,22 @@ pub fn deviceFactorEdgeAB(gpa: std.mem.Allocator, io: std.Io, d: *Draft, fix_dir
 
     // Read fixture data
     const out_normed = try readFixtureF32(io, gpa, fix_dir, "out_normed.f32", rows * hd);
+    defer gpa.free(out_normed); // maintainer ask 3: the fixture ladder frees every host buffer it reads
+
     const anchor_normed = try readFixtureF32(io, gpa, fix_dir, "anchor_normed.f32", hd);
+    defer gpa.free(anchor_normed); // maintainer ask 3: the fixture ladder frees every host buffer it reads
+
     const factor_hidden = try readFixtureF32(io, gpa, fix_dir, "factor_hidden.f32", rows * hd);
+    defer gpa.free(factor_hidden); // maintainer ask 3: the fixture ladder frees every host buffer it reads
+
     const edges = try readFixtureF32(io, gpa, fix_dir, "edges.f32", rows * 2 * factor);
+    defer gpa.free(edges); // maintainer ask 3: the fixture ladder frees every host buffer it reads
+
     const start_scores = try readFixtureF32(io, gpa, fix_dir, "start_scores.f32", topk);
+    defer gpa.free(start_scores); // maintainer ask 3: the fixture ladder frees every host buffer it reads
+
     const pair_scores = try readFixtureF32(io, gpa, fix_dir, "pair_scores.f32", (slots - 1) * topk * topk);
+    defer gpa.free(pair_scores); // maintainer ask 3: the fixture ladder frees every host buffer it reads
 
     // Upload inputs to device
     var out_normed_buf = try cuda.DeviceBuffer.alloc(d.e.ctx.d, rows * hd * 4);

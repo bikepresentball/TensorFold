@@ -174,6 +174,7 @@ pub fn deinit(d: *Draft) void {
     d.token_states_buf.free();
     d.draft_picks_buf.free();
     if (d.ds.staged) d.ds.buf.free();
+    d.staged.free(); // maintainer ask 3: the pinned staging carve is owned from init()'s S2 block on - every close hands it back
     if (d.open_stage == .ring or d.open_stage == .ready) d.tap_ring.free(); // owned from .ring on: undefined below it
 
     // Unload modules
@@ -328,6 +329,10 @@ pub fn init(d: *Draft, gpa: std.mem.Allocator, io: std.Io, e: *E, c: Config, wei
         (env.path("TF_BODY_FIXTURE", env.rawText("TF_BODY_FIXTURE")) catch null) != null)
     {
         try stageDeviceScratch(d);
+        errdefer { // maintainer ask 3: after the carve returns, a later init() failure still hands the scratch back before .core owns it
+            d.ds.staged = false;
+            d.ds.buf.free();
+        }
     }
 
     // S2 A/B (env-gated): TF_LILICORR_FIXTURE=<dir> runs the device token projection against
@@ -472,7 +477,11 @@ pub fn stageDeviceScratch(d: *Draft) !void {
     var total: usize = 0;
     for (sizes) |z| total += (z + 255) / 256 * 256;
     d.ds.buf = try cuda.DeviceBuffer.alloc(d.e.ctx.d, total);
-    errdefer d.ds.buf.free();
+    d.ds.staged = true; // maintainer ask 3: the flag holds exactly while the buffer is owned, so deinit's keyed free stays exact
+    errdefer { // maintainer ask 3: a failure below frees the carve AND unmarks it - the flag cannot outlive its buffer
+        d.ds.staged = false;
+        d.ds.buf.free();
+    }
     var at: u64 = 0;
     inline for (fields: {
         break :fields &.{ "pass_states", "anchor_state", "anchor_normed", "anchor_bits", "fm_up", "fm_up_bits", "fm", "lattice", "lattice2", "ain", "ain_f32", "qkv", "att", "proj", "up", "up_bf16", "pre_bits", "edges", "start", "pair", "fused_w", "fused_b", "bias", "feat_bits" };
@@ -481,7 +490,6 @@ pub fn stageDeviceScratch(d: *Draft) !void {
         at += (z + 255) / 256 * 256;
     }
     d.ds.anchor_tail_at = @intCast(rows * 2 * factor * 4);
-    d.ds.staged = true;
 
     // The fused edge head + the attention bias: open-time tensors, uploaded once here.
     const fused_w = try d.gpa.alloc(f32, 2 * factor * hd);
