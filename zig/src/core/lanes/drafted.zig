@@ -503,7 +503,8 @@ pub const Drafted = struct {
             if (x.lanes.count() + x.others.count() != 0) return error.DrafterBusy;
             return;
         }
-        if (x.lanes.count() != 0) return error.DrafterBusy; // a drafted walk is live: the pair is the mixture
+        if (x.others.contains(s)) return; // the stream's own pass continues (a resumed prompt)
+        if (x.lanes.count() + x.others.count() != 0) return error.DrafterBusy; // the pair refuses either way
         const got = try x.others.getOrPut(x.gpa, s); // counted so a drafted newcomer refuses the same way
         got.value_ptr.* = {};
     }

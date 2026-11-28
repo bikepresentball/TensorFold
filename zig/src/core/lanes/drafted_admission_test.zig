@@ -186,11 +186,14 @@ test "a drafted newcomer is refused beside a live undrafted stream; the incumben
     try std.testing.expectEqualSlices(u32, plain.tokens[0], c.emitted()); // drafted equals one-token decode
 }
 
-test "two undrafted streams serve fine under a one_stream drafter: the gate never engages" {
-    const one = try fixture.run(&.{.{ .prompt = &fixture.p1, .drafts = false }}, .plain, false);
-    defer fixture.freeOut(one);
-    const two = try fixture.run(&.{.{ .prompt = &fixture.p2, .drafts = false }}, .plain, false);
-    defer fixture.freeOut(two);
+// Maintainer ask 1 (PR 5102 FINISH leg F1): with --drafter armed (the one-stream fact live) the
+// target's shared window rides one segment, so two drafting-disabled requests both admitted was a
+// post-admission verification failure - the older cell let that pair serve. The refusal now stands
+// at the same admission seam as the mixtures: the second undrafted request fails whole before any
+// target work, the incumbent byte-identical to its solo run, recovery admitted after it ends.
+test "a second undrafted request is refused before target work under a one_stream drafter" {
+    const solo = try fixture.run(&.{.{ .prompt = &fixture.p1, .drafts = false }}, .plain, false);
+    defer fixture.freeOut(solo);
 
     var target: fake.Fake = .{ .gpa = gpa };
     defer target.deinit();
@@ -209,16 +212,43 @@ test "two undrafted streams serve fine under a one_stream drafter: the gate neve
     defer pa.deinit();
     var a = try sm.Stream.init(gpa, .{ .id = "a", .prompt = &fixture.p1, .max_new = 40, .eos = &.{96}, .drafts = false, .proposer = pa.proposer() });
     defer a.deinit(gpa);
+    try engine.addStream(&a); // the undrafted incumbent alone: no drafter open
+
+    const prefills = target.prefill_count;
     var pb = try SuffixLookup.init(gpa, .{ .min_match = 4 });
     defer pb.deinit();
     var b = try sm.Stream.init(gpa, .{ .id = "b", .prompt = &fixture.p2, .max_new = 40, .eos = &.{96}, .drafts = false, .proposer = pb.proposer() });
     defer b.deinit(gpa);
-    try engine.addStream(&a);
-    try engine.addStream(&b); // no mixture exists: both serve fine, the fast path unbroken
+    try std.testing.expectError(error.DrafterBusy, engine.addStream(&b)); // refused whole, before target work
+    try std.testing.expectEqual(prefills, target.prefill_count); // no launch for b, and none replayed for a
+    try std.testing.expectEqual(@as(u32, 0), head.opens);
+    try std.testing.expectEqual(@as(usize, 0), wrapped.lanes.count());
+
     while (engine.activeCount() > 0) try engine.step();
     try std.testing.expect(a.finished);
-    try std.testing.expect(b.finished);
-    try std.testing.expectEqualSlices(u32, one.tokens[0], a.emitted());
-    try std.testing.expectEqualSlices(u32, two.tokens[0], b.emitted());
-    try std.testing.expectEqual(@as(u32, 0), head.opens); // the drafter never engaged
+    try std.testing.expectEqualSlices(u32, solo.tokens[0], a.emitted()); // the incumbent byte-identical
+
+    // the incumbent ended: a later undrafted request is admitted (recovery unchanged for either kind)
+    var pc = try SuffixLookup.init(gpa, .{ .min_match = 4 });
+    defer pc.deinit();
+    var c = try sm.Stream.init(gpa, .{ .id = "c", .prompt = &fixture.p2, .max_new = 40, .eos = &.{96}, .drafts = false, .proposer = pc.proposer() });
+    defer c.deinit(gpa);
+    try engine.addStream(&c);
+    while (engine.activeCount() > 0) try engine.step();
+    try std.testing.expect(c.finished);
+    const plain = try fixture.run(&.{.{ .prompt = &fixture.p2, .drafts = false }}, .plain, false);
+    defer fixture.freeOut(plain);
+    try std.testing.expectEqualSlices(u32, plain.tokens[0], c.emitted()); // undrafted equals its solo run
+}
+
+test "two undrafted streams still serve fine without the one-stream fact: the gate never engages" {
+    const one = try fixture.run(&.{.{ .prompt = &fixture.p1, .drafts = false }}, .plain, false);
+    defer fixture.freeOut(one);
+    const two = try fixture.run(&.{.{ .prompt = &fixture.p2, .drafts = false }}, .plain, false);
+    defer fixture.freeOut(two);
+    const both = try fixture.run(&.{ .{ .prompt = &fixture.p1, .drafts = false }, .{ .prompt = &fixture.p2, .drafts = false } }, .wrapped, false);
+    defer fixture.freeOut(both);
+    try std.testing.expectEqualSlices(u32, one.tokens[0], both.tokens[0]); // undrafted-main parity under the wrapper
+    try std.testing.expectEqualSlices(u32, two.tokens[0], both.tokens[1]);
+    try std.testing.expectEqual(@as(u32, 0), both.head.opens); // the gate inert: no refusal, no drafter open
 }
