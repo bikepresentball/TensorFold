@@ -1,16 +1,29 @@
 // PR 5102 owner ask 5 (DT-20261128-134621, seat builder): the a9 controls re-point at the
+
 // PRODUCTION kernel entry/layout faces the maintainer cites (cuda_lilicorr_round.zig:314-320).
+
 //   FACTOR control: widen -> tf_lilicorr_factor_rows at the production launch face (grid
+
 //     (hd+7)/8, block 256; rows 56, hd 1024; three dot terms + bias + silu, bf16 out),
+
 //     the entry production launches - not the tf_lilicorr_factor sibling.
+
 //   TAIL control: tf_lilicorr_factor_rows hd=6 rows=9 (tail warps t=6,7 alive as load
+
 //     workers) - closed form v = t + 6r - 8.5 for EVERY row plus the committed C2 goldens.
+
 //   CHAIN control: drafter-head chain rms -> in-proj gemv -> lat_attn -> narrow -> the fused
+
 //     edge head and the separate anchor head -> l2norm -> dots on the PRODUCTION interleaved
+
 //     edges (stride 2048: each edge row = the head's out-half at +0, in-half at +1024; a
+
 //     separate 1024-wide anchor tail row right behind the 56 edge rows) - the round's
+
 //     316-320 faces, not a flat stride-1024 disclosure face. Planted RED reruns on exactly
+
 //     these shapes via the committed injectors; sanitizer runs against this binary's shapes.
+
 #include <cuda_bf16.h>
 #include <cstdio>
 #include <cstdlib>
@@ -18,6 +31,7 @@
 #include <cstdint>
 #include <cmath>
 #include <vector>
+
 #include "common/reduce.cuh"
 
 namespace tf_q35d {
@@ -50,6 +64,7 @@ __device__ __forceinline__ float tf_lilicorr_block_sum(float v, float* red) {
 using namespace tf_q35d;
 
 #include "qwen35_draft_lilicorr.cuh"
+
 // ---------------- host helpers ----------------
 
 static inline uint16_t f2bf_rn(float f) {
@@ -119,6 +134,7 @@ static void control_factor() {
     for (size_t i = 0; i < (size_t)hd * hd; i++) { w1[i] = rng_normal(1.0 / 32.0); w2[i] = rng_normal(1.0 / 32.0); w3[i] = rng_normal(1.0 / 512.0); }
     for (int t = 0; t < hd; t++) { b[t] = -2.0f + rng_uniform() * 9.0f; anch[t] = rng_normal(0.25); }
     // W layout [t][3 slab][hd] flattened: slab0 = w1 (A term), slab1 = w2 (anchor term), slab2 = w3 (cross).
+
     // tf_lilicorr_factor_rows reads the same layout (w[t*3*hd], w[hd..], w[2*hd..]).
 
     std::vector<float> W((size_t)hd * 3 * hd);
@@ -144,6 +160,7 @@ static void control_factor() {
     LAUNCH_OK();
     CUDA_OK(cudaDeviceSynchronize());
     // Stage 2: the PRODUCTION factor face (cuda_lilicorr_round.zig:315): grid (hd+7)/8 = 128
+
     // blocks, block 256 = 8 t-cols x 32 i-lanes, the tf_lilicorr_factor_rows entry.
 
     printf("FACTOR widen done\n");
@@ -204,10 +221,15 @@ static void control_tail() {
     CUDA_OK(cudaMemcpy(out.data(), d_OUT, out.size() * 2, cudaMemcpyDeviceToHost));
 
     // The committed C2 goldens (rows 0..2, ask-5 part C cell 2) re-verified on-device.
+
     // NOTE (A9, 11/27): the committed cell originally pinned SIGMOID goldens here; the
+
     // first device run of this control REDd on them - the real kernel (and its sibling
+
     // tf_lilicorr_factor, and the head's Zig reference at cuda_lilicorr_head.zig:380)
+
     // outputs silu. The cell was cured to these silu goldens in the same leg; the RED
+
     // face is this control's committed injector runs.
 
     static const float GOLD[3][6] = {
@@ -236,12 +258,16 @@ static void control_tail() {
 }
 
 // ===== CHAIN control: rms -> in-proj gemv -> lat_attn -> narrow -> fused edge head + =======
+
 // ===== separate anchor head -> l2norm -> dots, the PRODUCTION interleaved edge layout ======
 
 static const int CH_ROWS = 56, CH_HID = 1024, CH_I3 = 3072, CH_LATTICE = 56, CH_HDIM = 128;
 // The production edges geometry (cuda_lilicorr_round.zig:316-320): one edge row = stride
+
 // 2048 f32 - the fused head's out-half at +0, in-half at +1024 (dots' IN_VEC rides
+
 // edges + factor*4 bytes) - and a separate 1024-wide (= hd) anchor tail row right behind
+
 // the 56 edge rows (anchor_tail_at = rows*2*factor*4 bytes).
 
 static const int CH_STRIDE = 2048;   // 2 * factor: the edge row stride
@@ -316,7 +342,9 @@ static void chain_mirror(ChainHost& c) {
         for (int i = 0; i < CH_HID; i++)
             c.pb[(size_t)r * CH_HID + i] = f2bf_rn((float)att[(size_t)r * CH_HID + i]);
     // the interleaved edges: each of the 56 rows = the fused head's 2048 f32 outputs; the
+
     // anchor tail row (1024) right behind; the tail row's upper half of its 2048 stride is
+
     // the stale park (see chain_run_device) - the S4 over-run's fuel again.
 
     auto& E = c.E;
@@ -339,7 +367,9 @@ static void chain_mirror(ChainHost& c) {
         }
     }
     // l2norm: 56 edge rows = TWO independent 1024 halves each (stride 2048); the anchor
+
     // tail row = width 1024 only (tail_width = hd, the S4 cure). The clean run never
+
     // touches the pixels behind the tail; the injected width reads them into the inv.
 
     for (int r = 0; r < CH_ROWS; r++)
@@ -356,6 +386,7 @@ static void chain_mirror(ChainHost& c) {
         for (int i = 0; i < CH_TAIL; i++) E[(size_t)CH_ROWS * CH_STRIDE + i] *= inv;
     }
     // dots (production pointers): start[b] = dot(tail, in-half of edge b); pair[s,i,j] =
+
     // dot(out-half of edge s*8+i, in-half of edge (s+1)*8+j); every row moves by STRIDE.
 
     c.start.assign(8, 0.0);
@@ -376,7 +407,9 @@ static void chain_mirror(ChainHost& c) {
 
 static void chain_run_device(const ChainHost& c, float* d_start, float* d_pair) {
     // E = 56 edge rows (stride 2048) + the anchor tail row + two guard rows; the stale
+
     // park sits at the tail row's upper half of its stride - the bytes an injected
+
     // tail_width=stride reads into the anchor's inv (deterministic wrong-answer RED).
 
     float* d_E;         CUDA_OK(cudaMalloc(&d_E, (size_t)(CH_ROWS + 3) * CH_STRIDE * 4));
@@ -410,6 +443,7 @@ static void chain_run_device(const ChainHost& c, float* d_start, float* d_pair) 
         cudaFree(d_H1);
     }
     // 3. lat_attn (grid 56*8=448, block 128) -> att f32 [56][1024]; then the REAL narrow
+
     //    (grid ceil(n/1024), block 1024) -> the head's bf16 input, the round:317 seam.
 
     tf_lilicorr_lat_attn<<<CH_ROWS * 8, CH_HDIM>>>(d_QKV, d_BIAS, d_ATT, CH_LATTICE, CH_HID, CH_HDIM);
@@ -418,7 +452,9 @@ static void chain_run_device(const ChainHost& c, float* d_start, float* d_pair) 
     LAUNCH_OK();
     CUDA_OK(cudaDeviceSynchronize());
     // 4. the PRODUCTION edge writers: the fused head (in hd, out 2*factor, rows - the
+
     //    round:316 face) writes rows 0..55; the anchor head (in hd, out hd, 1 row - the
+
     //    round:318 face) writes the separate tail row at anchor_tail_at.
 
     CUDA_OK(cudaMemset(d_E, 0, (size_t)(CH_ROWS + 3) * CH_STRIDE * 4));
@@ -435,6 +471,7 @@ static void chain_run_device(const ChainHost& c, float* d_start, float* d_pair) 
 
     tf_lilicorr_l2norm<<<CH_ROWS + 1, 1024>>>(d_E, CH_ROWS, CH_STRIDE, CH_TAIL, 1e-6f);
     // 7. dots (grid 8 + 384 = 392, block 256) at the production pointers: ANCHOR_OUT = the
+
     //    tail row, IN_VEC = edges + factor*4 bytes, every row index moves by stride 2048.
 
     tf_lilicorr_dots<<<392, 256>>>(d_E + (size_t)CH_ROWS * CH_STRIDE, d_E, d_E + CH_TAIL, d_start, d_pair, CH_STRIDE);

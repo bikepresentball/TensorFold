@@ -1,12 +1,20 @@
 #!/bin/bash
 # A9 fail-before injector - FACTOR control: the cross-term W-slab fold at the PRODUCTION entry.
+
 # Re-introduces the slab mis-index class against the scratch copy of the kernel header's
+
 # tf_lilicorr_factor_rows (the entry cuda_lilicorr_round.zig:315 launches): the cross term
+
 # reads the anchor-term slab (w[hd + ii]) instead of its own (w[2 * hd + ii]). The device
+
 # factor output then mis-folds every row at the production shape (rows 56, hd 1024, grid 128)
+
 # and the FACTOR control's host mirror grades RED. The TAIL control keeps its goldens: its
+
 # w2 slab is zero AND its anchor is all zero, so the folded term contributes exactly zero.
+
 # Never edits the repo tree: the caller runs this against a COPY (see a9_run.sh).
+
 # Usage: bash a9_inject_factor.sh <scratch-dir>
 
 set -eu
