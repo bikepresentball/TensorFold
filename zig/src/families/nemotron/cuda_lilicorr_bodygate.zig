@@ -313,8 +313,8 @@ pub fn deviceFullChainAB(gpa: std.mem.Allocator, io: std.Io, d: *Draft, fix_dir:
 
     // the chain identity: device scores and goldens must walk to the same indices
     var cand0: [head.slots * topk]u32 = @splat(0);
-    const ch_dev = try walk.chain(&start_dev, &pair_dev, &cand0);
-    const ch_gold = try walk.chain(start_gold, pair_gold, &cand0);
+    const ch_dev = try walk.chain(&start_dev, &pair_dev, &cand0, topk);
+    const ch_gold = try walk.chain(start_gold, pair_gold, &cand0, topk);
     var chain_ok = true;
     for (ch_dev.index, ch_gold.index) |a, b| {
         if (a != b) chain_ok = false;

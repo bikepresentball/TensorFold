@@ -19,11 +19,12 @@ pub const Chain = struct {
 };
 
 /// Greedy chain over start [slots] and pair [(slots-1) * topk * topk]: ties take the lowest column (argmax order).
-pub fn chain(start: []const f32, pair: []const f32, cand: []const u32) !Chain { // start [topk], pair [(slots-1) * topk * topk]
+pub fn chain(start: []const f32, pair: []const f32, cand: []const u32, band: usize) !Chain {
+    if (band == 0 or band > topk) return error.BadWalkBand; // the config's packed band: 0 and past the lattice refuse
     var out: Chain = .{ .tokens = undefined, .index = undefined, .scores = undefined };
     var previous: usize = 0;
     for (0..slots) |s| {
-        const row = if (s == 0) start[0..topk] else pair[((s - 1) * topk + previous) * topk ..][0..topk];
+        const row = if (s == 0) start[0..band] else pair[((s - 1) * topk + previous) * topk ..][0..band];
         var best: usize = 0;
         var value = row[0];
         for (row[1..], 1..) |v, i| if (v > value) {
@@ -65,7 +66,7 @@ test "the greedy chain follows the transition argmaxes and the start row" {
     start[5] = 9.0;
     for (0..topk) |j| pair[(0 * topk + 5) * topk + j] = if (j == 3) 7.0 else -7.0; // from (0, 5) into slot 1
     for (0..topk) |j| pair[(1 * topk + 3) * topk + j] = if (j == 0) 6.0 else -6.0; // from (1, 3)
-    const got = try chain(start, pair, cand);
+    const got = try chain(start, pair, cand, topk);
     try std.testing.expectEqual(@as(usize, 5), got.index[0]);
     try std.testing.expectEqual(@as(usize, 3), got.index[1]);
     try std.testing.expectEqual(@as(usize, 0), got.index[2]);
@@ -88,11 +89,11 @@ test "ties take the lowest column and a NaN row refuses" {
     @memset(start, 1.0); // every column ties: the walk takes column 0
     @memset(pair, 0.5);
     @memset(cand, 42);
-    const got = try chain(start, pair, cand);
+    const got = try chain(start, pair, cand, topk);
     for (got.index) |i| try std.testing.expectEqual(@as(usize, 0), i);
     try std.testing.expectEqual(@as(f32, 1.0), got.scores[0]);
     start[0] = std.math.nan(f32);
-    try std.testing.expectError(error.BadWalkScore, chain(start, pair, cand));
+    try std.testing.expectError(error.BadWalkScore, chain(start, pair, cand, topk));
 }
 
 test "walkMatrix is the start row expanded then the scaled pairs, and realizedScores re-reads it" {
@@ -117,4 +118,25 @@ test "walkMatrix is the start row expanded then the scaled pairs, and realizedSc
     try std.testing.expectEqual(pair[(0 * topk + 3) * topk + 5], got[1]);
     try std.testing.expectEqual(pair[(1 * topk + 5) * topk + 1], got[2]);
     try std.testing.expectError(error.BadWalkScore, realizedScores(start, pair, &[_]usize{ 3, 5, 1, 0, 7, 2, topk }, got));
+}
+
+test "the configured band bounds the greedy chain and reads the packed slots (owner F2 top-k)" {
+    const a = std.testing.allocator;
+    const start = try a.alloc(f32, topk);
+    defer a.free(start);
+    const pair = try a.alloc(f32, (slots - 1) * topk * topk);
+    defer a.free(pair);
+    const cand = try a.alloc(u32, slots * topk);
+    defer a.free(cand);
+    for (start) |*v| v.* = 0.5;
+    for (pair) |*v| v.* = 0.5;
+    for (cand, 0..) |*v, i| v.* = @intCast(100 + i); // slot s's column k packs cand[s * topk + k]
+    start[5] = 9.0; // an UNPACKED column (the config packs the band's prefix only) dominates the full row
+    start[1] = 6.0; // the band's second column beats its first
+    try std.testing.expectError(error.BadWalkBand, chain(start, pair, cand, 0));
+    try std.testing.expectError(error.BadWalkBand, chain(start, pair, cand, topk + 1));
+    const got = try chain(start, pair, cand, 2);
+    try std.testing.expectEqual(@as(usize, 1), got.index[0]); // band-bounded columns 0..1, the higher wins
+    try std.testing.expectEqual(@as(u32, 101), got.tokens[0]); // the packed slot cand[0 * topk + 1]
+    for (got.index) |i| try std.testing.expect(i < 2); // no step of the walked chain leaves the band
 }

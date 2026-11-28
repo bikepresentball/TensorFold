@@ -152,7 +152,7 @@ test "the head and the walk reproduce the reference on the golden fixture" {
     // the walk over the reference scores: deterministic, and its realized scores are the picked rows
     const cand = try gpa.alloc(u32, head.slots * head.topk);
     for (cand, 0..) |*v, i| v.* = @intCast(i);
-    const c = try walk.chain(got.start, got.pair, cand);
+    const c = try walk.chain(got.start, got.pair, cand, head.topk);
     const realized = try gpa.alloc(f32, head.slots);
     try walk.realizedScores(got.start, got.pair, &c.index, realized);
     for (realized, c.scores) |r, s| try std.testing.expectEqual(s, r);
@@ -161,7 +161,7 @@ test "the head and the walk reproduce the reference on the golden fixture" {
     const scaled_pair = try gpa.alloc(f32, (head.slots - 1) * head.topk * head.topk);
     for (got.start, scaled_start) |v, *o| o.* = 8.0 * v;
     for (got.pair, scaled_pair) |v, *o| o.* = 8.0 * v;
-    const c2 = try walk.chain(scaled_start, scaled_pair, cand);
+    const c2 = try walk.chain(scaled_start, scaled_pair, cand, head.topk);
     try std.testing.expectEqualSlices(usize, &c.index, &c2.index);
     // a matrix built with the reference's scale reads back the realized scores times the scale
     const matrix = try gpa.alloc(f32, head.slots * head.topk * head.topk);

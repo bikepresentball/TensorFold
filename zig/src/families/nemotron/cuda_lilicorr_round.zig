@@ -398,9 +398,10 @@ pub fn hold(d: *Draft, items: []const Hold) !void {
             const words = std.mem.bytesAsSlice(u32, st[row_base..][0 .. lp * 4]);
             const lse: f32 = @bitCast(words[0]);
             for (0..topk) |k| {
-                cand[r * topk + k] = words[2 + k];
+                // one layout: the head's fixed slots*topk lattice (owner F2); the pack fills the band's prefix
+                cand[r * head.topk + k] = words[2 + k];
                 const logit: f32 = @bitCast(words[2 + 20 + k]);
-                log_probs[r * topk + k] = logit - lse;
+                log_probs[r * head.topk + k] = logit - lse;
             }
         }
         // token embeddings: the TARGET's embedding rows of the 56 candidate ids, gathered
@@ -439,7 +440,7 @@ pub fn hold(d: *Draft, items: []const Hold) !void {
             try deviceScore(d, d.cand_emb, d.x, d.anchor_buf.ptr, ctx.anchor_valid, d.ds.feat_bits, &start_f32, &pair_f32);
             if (holdProfOn()) hp_score += holdMs() - hp_t_score;
             const hp_t_walk = holdStamp();
-            const ch = try walk.chain(&start_f32, &pair_f32, &cand);
+            const ch = try walk.chain(&start_f32, &pair_f32, &cand, topk);
             if (holdProfOn()) hp_walk += holdMs() - hp_t_walk;
 
             // Debug print for draft proposals
@@ -449,7 +450,7 @@ pub fn hold(d: *Draft, items: []const Hold) !void {
                 std.debug.print("[draft-debug-d] rows={d} cand[0..{d}]=", .{ rows, max_print });
                 for (0..max_print) |ci| std.debug.print("{d} ", .{cand[ci]});
                 std.debug.print("chosen=", .{});
-                for (0..max_print) |ri| std.debug.print("{d} ", .{cand[ri * topk + ch.index[ri]]});
+                for (0..max_print) |ri| std.debug.print("{d} ", .{cand[ri * head.topk + ch.index[ri]]});
                 std.debug.print("start={d:.4},{d:.4},{d:.4},{d:.4},{d:.4},{d:.4},{d:.4},{d:.4} chain0={d}\n", .{ start_f32[0], start_f32[1], start_f32[2], start_f32[3], start_f32[4], start_f32[5], start_f32[6], start_f32[7], ch.index[0] });
                 // per-candidate feature distinctness: the 8 row-0 candidates' token_proj outputs + the anchor
                 {
@@ -513,7 +514,7 @@ pub fn hold(d: *Draft, items: []const Hold) !void {
                 }
             }
 
-            for (0..rows) |r| ctx.held[r] = cand[r * topk + ch.index[r]];
+            for (0..rows) |r| ctx.held[r] = cand[r * head.topk + ch.index[r]];
             ctx.held_n = rows;
             continue;
         }
@@ -530,9 +531,9 @@ pub fn hold(d: *Draft, items: []const Hold) !void {
         defer got.deinit(d.gpa); // the call's two survivors; every intermediate died with the call
         if (holdProfOn()) hp_score += holdMs() - hp_t_score;
         const hp_t_walk = holdStamp();
-        const ch = try walk.chain(got.start, got.pair, &cand);
+        const ch = try walk.chain(got.start, got.pair, &cand, topk);
         if (holdProfOn()) hp_walk += holdMs() - hp_t_walk;
-        for (0..rows) |r| ctx.held[r] = cand[r * topk + ch.index[r]];
+        for (0..rows) |r| ctx.held[r] = cand[r * head.topk + ch.index[r]];
         ctx.held_n = rows;
     }
     if (holdProfOn()) std.debug.print("[hold-profile] fwd={d:.2} body={d:.2} sync={d:.2} emb={d:.2} score={d:.2} walk={d:.2} launch={d:.2} n={d} sum={d:.2} max={d:.2} d1={d:.2} d2={d:.2} dssync={d:.2}\n", .{ hp_fwd, hp_body, hp_sync, hp_emb, hp_score, hp_walk, hp_launch, hp_n, hp_sum, hp_max, hp_d1, hp_d2, hp_sync2 });
