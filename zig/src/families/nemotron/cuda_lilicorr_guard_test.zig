@@ -46,11 +46,14 @@ const AbsorbGuard = struct {
     var f_arg0: [96]u64 = undefined; // param 0's value: a norm-tail's input row pointer
     var f_rows_n: [96]i32 = undefined; // the gather_rows by-value TapRows' n, as the kernel reads it
     var f_rows: [96][64]u32 = undefined; // ...and its first 64 row entries (the kernel's int rows[64])
+    var f_tapn: [96]i32 = undefined; // the gathers' arg 1: the ring's row count the launch carries
+    var f_start: [96]i64 = undefined; // the gathers' arg 2: the trim-adjusted start position
     var count: usize = 0;
     var ex_count: usize = 0;
 
     // handle values the harness fixture pins: gather_rows = 0x1101, norm tails = 0x9100/0x9108
     const gather_rows_handle = 0x1101;
+    const gather_taps_handle = 0x1100; // the dense staging gather
     const tail_handles = [_]usize{ 0x9100, 0x9108 };
 
     fn fake(dv: *const cuda.Driver, h: usize) cuda.Function {
@@ -79,10 +82,14 @@ const AbsorbGuard = struct {
                     }) {
                         f_arg0[count] = @as(*u64, @ptrCast(@alignCast(ps[0].?))).*;
                     }
-                    if (hv == gather_rows_handle) {
-                        const b: [*]u8 = @ptrCast(@alignCast(ps[3].?));
-                        f_rows_n[count] = std.mem.readInt(i32, b[0..4], .little);
-                        for (0..64) |j| f_rows[count][j] = std.mem.readInt(u32, b[4 + j * 4 ..][0..4], .little);
+                    if (hv == gather_rows_handle or hv == gather_taps_handle) {
+                        f_tapn[count] = std.mem.readInt(i32, @as([*]u8, @ptrCast(@alignCast(ps[1].?)))[0..4], .little);
+                        f_start[count] = std.mem.readInt(i64, @as([*]u8, @ptrCast(@alignCast(ps[2].?)))[0..8], .little);
+                        if (hv == gather_rows_handle) {
+                            const b: [*]u8 = @ptrCast(@alignCast(ps[3].?));
+                            f_rows_n[count] = std.mem.readInt(i32, b[0..4], .little);
+                            for (0..64) |j| f_rows[count][j] = std.mem.readInt(u32, b[4 + j * 4 ..][0..4], .little);
+                        }
                     }
                 }
                 count += 1;
@@ -345,4 +352,187 @@ test "the absorb chunk cap keeps every gathered row at staging_rows (owner ask-5
         std.debug.print("[absorb-rows] n={d}: launches={d} gathers={d} exp_done={d} pdl_ex={d} fail_n={d}\n", .{ rows_in, g.count, gathers, exp_done, g.ex_count, fail_n });
     }
     try t.expectEqual(@as(usize, 0), fail_n);
+}
+
+test "the absorb keep never underflows a narrow ring and the trim keeps the list's right rows (owner F2)" {
+    const t = std.testing;
+    const g = AbsorbGuard;
+    const lc = g.lc;
+    const cuda = g.cuda;
+
+    var driver: cuda.Driver = undefined;
+    driver.api.cuLaunchKernel = g.Fake.launch;
+    driver.api.cuLaunchKernelEx = g.Fake.launchEx;
+    driver.api.cuMemcpyDtoHAsync_v2 = g.Fake.memcpyH;
+
+    var e: lc.E = undefined;
+    var ctx_dev: cuda.Context = .{ .d = &driver, .device = 0, .handle = null };
+    e.ctx = &ctx_dev;
+    e.stream = .{ .d = &driver, .handle = null };
+    e.b = undefined;
+    e.k = undefined;
+    e.k.wide = true;
+    e.k.modelopt = null;
+    e.k.ck = null;
+    e.k.ggml = null;
+    const fade = g.fake(&driver, 0x9000);
+    e.k.affine = .{
+        .group_fn = fade,
+        .mlp128_fn = fade,
+        .gemv_fn = fade,
+        .verify_fn = fade,
+        .verify64_fn = fade,
+        .verify128_fn = fade,
+        .split_fn = fade,
+        .seg_fn = fade,
+        .many_fn = fade,
+        .prefill_fn = fade,
+        .prefill22_fn = fade,
+        .prefill_many_fn = fade,
+        .words_fn = fade,
+        .scales_fn = fade,
+        .gemv_blocks = 1,
+        .split = null,
+        .pdl = true,
+        .wide_verify = false,
+    };
+    e.k.norms = undefined;
+    e.k.norms.tail_fns = .{ g.fake(&driver, 0x9100), g.fake(&driver, 0x9108) };
+
+    var d: lc.Draft = undefined;
+    d.e = &e;
+    d.c = .{
+        .hidden = 128,
+        .intermediate = 128,
+        .layers = 1,
+        .vocab = 16,
+        .heads = 2,
+        .kv_heads = 1,
+        .head_dim = 32,
+        .block = 4,
+        .mask = 0,
+        .window = 4096,
+        .group = 8,
+        .rank = 4,
+        .topk = 2,
+        .eps = 1e-5,
+        .theta = 10000,
+        .taps = .{ 1, 2, 3, 4, 5, 6, 7, 8 },
+        .n_taps = 4,
+    };
+    d.gpa = t.allocator;
+    d.tap_rows = 512;
+    d.taps_in = 0x1a0000;
+    d.th = 0x1b0000;
+    d.thn = 0x1c0000;
+    d.kabs = 0x1d0000;
+    d.vabs = 0x1e0000;
+    d.kn = 0x1f0000;
+    d.xs = 0x200000;
+    d.anchor = 0x210000;
+    var staged_b: [8192]u8 align(16) = @splat(0);
+    d.staged = .{ .d = &driver, .bytes = staged_b[0..] };
+    d.w = undefined;
+    d.w.fc = .{ .w = 0x30000, .s = 0x31000, .b = 0x32000, .n = 64, .k = 1024, .npad = 128 };
+    d.w.hidden_norm = 0x220000;
+    const wq: cuda.qlinear.Weight = .{ .affine4 = .{ .w = 0x33000, .s = 0x34000, .b = 0x35000, .n = 64, .k = 1024, .npad = 128 } };
+    var lz: [1]guard_wts.Layer = .{.{ .input_norm = 0x40000, .post_norm = 0x40040, .q = wq, .k = wq, .v = wq, .o = wq, .q_norm = 0x40080, .k_norm = 0x400c0, .sink = 0x40100, .gate = wq, .up = wq, .down = wq, .attn_conv = wq, .attn_base = 0x40140, .mlp_conv = wq, .mlp_base = 0x40180 }};
+    d.w.layers = lz[0..];
+    d.fns = .{
+        .gather_taps = g.fake(&driver, 0x1100),
+        .gather_rows = g.fake(&driver, 0x1101),
+        .norm_rope = g.fake(&driver, 0x1102),
+        .ring_put = g.fake(&driver, 0x1103),
+        .sums = g.fake(&driver, 0x1104),
+        .norm_rope_batch = g.fake(&driver, 0x1105),
+        .attn_partial = g.fake(&driver, 0x1106),
+        .attn_merge = g.fake(&driver, 0x1107),
+        .mlp_act = g.fake(&driver, 0x1108),
+        .mask_rows = g.fake(&driver, 0x1109),
+        .dyn_conv_batch = g.fake(&driver, 0x110a),
+        .token_proj = g.fake(&driver, 0x110b),
+        .lat_attn = g.fake(&driver, 0x110c),
+        .factor = g.fake(&driver, 0x110d),
+        .edge_linear = g.fake(&driver, 0x110e),
+        .l2norm = g.fake(&driver, 0x110f),
+        .dots = g.fake(&driver, 0x1110),
+        .rms = g.fake(&driver, 0x1111),
+        .lin_f32 = g.fake(&driver, 0x1112),
+        .silu_bf16 = g.fake(&driver, 0x1113),
+        .add_bf16 = g.fake(&driver, 0x1114),
+        .lattice = g.fake(&driver, 0x1115),
+        .rms_f32 = g.fake(&driver, 0x1116),
+        .widen = g.fake(&driver, 0x1117),
+        .narrow = g.fake(&driver, 0x1118),
+    };
+    d.affine = e.k.affine;
+
+    const ring_buf: cuda.DeviceBuffer = .{ .d = &driver, .ptr = 0x5a000000, .len = 1 << 24 };
+    const rows_h = @intFromPtr(d.fns.gather_rows.handle.?);
+
+    // CELL A (narrow-window): ring truth - the window keeps working on rings that cannot spare the
+    // reserve, and every accepted window is underflow-free.
+    {
+        d.c.window = 64; // an accepted window (16..2048); its 64+16-row ring cannot spare the 256 reserve
+        d.tap_rows = 80;
+        g.reset();
+        var ctx_s: lc.Ctx = .{ .ring = ring_buf };
+        var absorb_err: ?anyerror = null;
+        guard_absorb.absorbRows(&d, &ctx_s, 0x6a000000, 1234, 100, null, true) catch |err| {
+            absorb_err = err;
+        };
+        try t.expect(absorb_err == null); // the cure: keep = min(64, 64+16) = 64 - no wrap, the window works
+        var gathers_a: usize = 0;
+        const taps_h = @intFromPtr(d.fns.gather_taps.handle.?);
+        for (0..g.count) |i| {
+            if (@intFromPtr(g.f_handle[i].?) == taps_h) {
+                gathers_a += 1;
+                try t.expectEqual(@as(usize, 64), g.f_grid[i]); // the kept rows only, in one staging chunk
+                try t.expectEqual(@as(i32, 80), g.f_tapn[i]); // the ring's rows ride the launch
+                try t.expectEqual(@as(i64, 1234 + 36), g.f_start[i]); // the trim's 36-row advance
+            }
+        }
+        try t.expectEqual(@as(usize, 1), gathers_a);
+        try t.expect(ctx_s.begin == 1270 and ctx_s.end == 1334); // head 36 drop; the pass ends at +64
+    }
+
+    // CELL B (trimmed-permuted): the trim keeps THE RING'S newest `keep` rows - on an unordered list
+    // the entries at or past the drop, rebased - never the list's own head or tail slice.
+    {
+        d.c.window = 256; // keep = min(256, 272 - 256) = 16: a 256-row batch trims 240, no wrap either tree
+        d.tap_rows = 272;
+        g.reset();
+        var ctx_s: lc.Ctx = .{ .ring = ring_buf };
+        const n_b: usize = 256;
+        var rs_b: [n_b]u32 = undefined;
+        for (0..n_b) |i| rs_b[i] = @intCast((i * 137 + 11) % n_b); // the same bijective permutation as the 129/256 drains
+        var absorb_err: ?anyerror = null;
+        guard_absorb.absorbRows(&d, &ctx_s, 0x6a000000, 1234, n_b, rs_b[0..], true) catch |err| {
+            absorb_err = err;
+        };
+        try t.expect(absorb_err == null);
+        var kept_want: usize = 0;
+        var want_rows: [lc.max_rows]u32 = undefined;
+        for (0..n_b) |i| {
+            const v: u32 = rs_b[i];
+            if (v >= 240) {
+                want_rows[kept_want] = v - 240;
+                kept_want += 1;
+            }
+        }
+        var gathers: usize = 0;
+        for (0..g.count) |li| {
+            if (@intFromPtr(g.f_handle[li].?) != rows_h) continue;
+            gathers += 1;
+            try t.expectEqual(@as(usize, 16), g.f_grid[li]); // one chunk of the 16 kept rows
+            try t.expectEqual(@as(i32, 16), g.f_rows_n[li]);
+            try t.expectEqual(@as(i32, 272), g.f_tapn[li]);
+            try t.expectEqual(@as(i64, 1234 + 240), g.f_start[li]);
+            var j: usize = 0;
+            while (j < 16) : (j += 1) {
+                try t.expectEqual(want_rows[j], g.f_rows[li][j]); // the qualifying entries, in list order
+            }
+        }
+        try t.expectEqual(@as(usize, 1), gathers);
+    }
 }

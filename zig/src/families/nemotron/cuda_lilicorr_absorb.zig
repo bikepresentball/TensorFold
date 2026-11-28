@@ -53,10 +53,25 @@ pub fn absorbRows(d: *Draft, ctx: *Ctx, tap_ring: u64, start_: u64, n_: usize, r
     if (rows_) |rs| if (rs.len != n or n > max_rows) return error.BadDraftRows;
     if (start < ctx.end) ctx.end = start;
     if (start > ctx.end) ctx.begin = start;
-    const keep = @min(c.window, d.tap_rows - max_rows);
+    // keep: the window under the ring's max_rows reserve; a ring that cannot spare it keeps its rows
+    var rows_tail: [max_rows]u32 = undefined;
+    var rows_list: ?[]const u32 = rows_;
+    // an explicit list trims BY VALUE: its offsets are unordered, so the entries past the drop REBASE
+    const keep = if (d.tap_rows > max_rows) @min(c.window, d.tap_rows - max_rows) else @min(c.window, d.tap_rows);
     if (n > keep) {
-        start += n - keep;
-        n = keep;
+        const drop = n - keep;
+        start += drop;
+        if (rows_list) |rs| {
+            var kept: usize = 0;
+            for (rs[0..n]) |r| {
+                if (@as(usize, r) >= drop) {
+                    rows_tail[kept] = r - @as(u32, @intCast(drop));
+                    kept += 1;
+                }
+            }
+            rows_list = rows_tail[0..kept];
+            n = kept;
+        } else n = keep;
         ctx.begin = start;
     }
     ctx.end = start;
@@ -68,9 +83,9 @@ pub fn absorbRows(d: *Draft, ctx: *Ctx, tap_ring: u64, start_: u64, n_: usize, r
         // kernel's own by-value TapRows capacity, and each chunk takes THE CHUNK'S slice
 
         // rs[done..done+rows] (never the list's head again — per-chunk restart was the sparse/permuted defect).
-        const rows = if (rows_ != null) @min(n, kernel_row_cap) else @min(n, staging_rows);
+        const rows = if (rows_list != null) @min(n, kernel_row_cap) else @min(n, staging_rows);
         last_rows = rows;
-        if (rows_) |rs| {
+        if (rows_list) |rs| {
             var tr: TapRows = .{ .n = @intCast(rows), .rows = @splat(0) };
             for (rs[done..][0..rows], 0..) |r, i| tr.rows[i] = @intCast(r);
             try run(d.e, d.fns.gather_rows, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ tap_ring, @as(c_int, @intCast(d.tap_rows)), @as(c_longlong, @intCast(start)), tr, @as(c_int, @intCast(c.n_taps * c.hidden)), d.taps_in });
