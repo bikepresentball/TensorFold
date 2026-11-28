@@ -396,7 +396,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, e: *E, dir: []const u8) !*Draft 
     errdefer gpa.destroy(d);
     d.ready = false; // create() hands over undefined memory: no field default exists until written
     d.ds = .{}; // S5b: the field default never applies under create() — undefined ds = garbage staged flag
-    d.open_stage = .none; // maintainer ask 3: create() hands over undefined memory - attachWeights' early cleanup reads this mark, so it must read .none, not garbage
+    d.open_stage = .none; // maintainer ask 3: create() hands over undefined memory - early cleanup reads this
     d.affine = try cuda.qlinear.Affine4Kernels.resolve(e.ctx.d, e.k.mods[0], e.k.mods[1], e.k.mods[15], e.k.mods[20], sms, e.k.gb10);
 
     // Load the config; only the LiLiCorr kind drives this driver (dflash2 has no Nemotron drafter upstream)

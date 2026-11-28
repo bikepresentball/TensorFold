@@ -14,7 +14,7 @@ pub fn readFixtureF32(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, name:
     const path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir, name });
     defer gpa.free(path);
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 30));
-    defer gpa.free(bytes); // maintainer ask 3: the reader frees its own raw blob - retention lived here too
+    defer gpa.free(bytes); // maintainer ask 3: the raw blob returns with the copy, never retained
     if (bytes.len != n * 4) return error.FixtureBlobSize;
     const out = try gpa.alloc(f32, n);
     @memcpy(out, @as([*]align(1) const f32, @ptrCast(bytes.ptr))[0..n]);

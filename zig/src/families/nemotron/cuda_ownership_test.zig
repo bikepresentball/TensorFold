@@ -22,6 +22,7 @@ const Rec = struct {
     var hto_calls: usize = 0;
     var fail_hto: ?usize = null; // the k-th HtoD copy refuses
     var fail_alloc: bool = false; // the next cuMemAlloc refuses
+    var host_free_n: usize = 0; // ask 3: pinned-host frees counted separately
 
     fn reset() void {
         next_addr = 0x7a000000;
@@ -32,6 +33,7 @@ const Rec = struct {
         hto_calls = 0;
         fail_hto = null;
         fail_alloc = false;
+        host_free_n = 0;
     }
 
     fn noteFree(p: u64) void {
@@ -86,19 +88,14 @@ const Fakes = struct {
         Rec.unload_calls += 1;
         return cuda.abi.success;
     }
-};
-
-/// The pinned-host recorder: stageDeviceScratch's staging and the pinned carve count through it.
-const HostMemo = struct {
-    var host_n: usize = 0;
 
     fn hostAlloc(p: *?*anyopaque, _: usize, _: c_uint) callconv(.c) cuda.abi.Result {
-        p.* = @ptrFromInt(0x7d000000);
+        p.* = @ptrFromInt(@as(usize, 0x7f000000));
         return cuda.abi.success;
     }
 
     fn hostFree(_: ?*anyopaque) callconv(.c) cuda.abi.Result {
-        host_n += 1;
+        Rec.host_free_n += 1;
         return cuda.abi.success;
     }
 };
@@ -110,6 +107,8 @@ fn armDriver(drv: *cuda.Driver) void {
     drv.api.cuMemcpyHtoD_v2 = Fakes.htoD;
     drv.api.cuStreamSynchronize = Fakes.sync;
     drv.api.cuModuleUnload = Fakes.unload;
+    drv.api.cuMemHostAlloc = Fakes.hostAlloc;
+    drv.api.cuMemFreeHost = Fakes.hostFree;
 }
 
 fn modAt(drv: *cuda.Driver, h: u64) cuda.Module {
@@ -229,9 +228,6 @@ test "normal close frees every owned byte once — body weights, staging arena, 
     const a = std.testing.allocator;
     var drv: cuda.Driver = undefined;
     armDriver(&drv);
-    drv.api.cuMemHostAlloc = HostMemo.hostAlloc;
-    drv.api.cuMemFreeHost = HostMemo.hostFree;
-    HostMemo.host_n = 0;
     Rec.reset();
     const base = cuda.memory.usage(false);
 
@@ -279,11 +275,10 @@ test "normal close frees every owned byte once — body weights, staging arena, 
 
     openz.deinit(&d); // the normal close: every owner surface hands back once
 
-    try std.testing.expectEqual(@as(usize, 1), HostMemo.host_n); // the pinned staging handed back exactly once (maintainer ask 3)
-    try std.testing.expectEqual(base.host, cuda.memory.usage(false).host); // its bytes left the usage ledger with it
-
     try std.testing.expectEqual(base.device, cuda.memory.usage(false).device); // bytes above and below every stage
-    try std.testing.expectEqual(@as(usize, 15), Rec.free_n); // 12 scratch + ring + w.arena + dhw.arena
+    try std.testing.expectEqual(base.host, cuda.memory.usage(false).host); // ask 3: the pinned staging returned too
+    try std.testing.expectEqual(@as(usize, 15), Rec.free_n); // 12 scratch + ring + w.arena + dhw.arena (host frees count separately)
+    try std.testing.expectEqual(@as(usize, 1), Rec.host_free_n); // ask 3: the pinned staging freed exactly once
     try std.testing.expectEqual(@as(usize, 2), Rec.unload_calls);
     try Rec.expectOnce(base);
 }
@@ -379,6 +374,79 @@ fn initAteNothing(d: *lc.Draft) void {
     }
 }
 
+test "scratch: a staged-carve upload failure frees the opt-in scratch once and unmarks it (PR 5102 ask 3)" {
+    const a = std.testing.allocator;
+    var drv: cuda.Driver = undefined;
+    armDriver(&drv);
+    var ctx: cuda.Context = undefined;
+    ctx.d = &drv;
+    ctx.device = 0;
+    ctx.handle = null;
+    var e_dummy: lc.E = undefined;
+    e_dummy.ctx = &ctx;
+    var hw_arena = std.heap.ArenaAllocator.init(a);
+    defer hw_arena.deinit();
+    var d: lc.Draft = undefined;
+    d.gpa = a;
+    d.e = &e_dummy;
+    d.ds = .{};
+    d.dhw = .{ // non-null: the DeviceWeightsMissing gate passes; only the deinit reads rent the layers+arena
+        .token_proj = .{ .w = 0 },
+        .pass_proj = .{ .w = 0 },
+        .ctx_proj = .{ .w = 0 },
+        .feature_norm_w = 0,
+        .feature_norm_b = 0,
+        .feature_up = .{ .w = 0 },
+        .feature_down = .{ .w = 0 },
+        .slot_emb = 0,
+        .rank_emb = 0,
+        .out_norm = 0,
+        .anchor_norm = 0,
+        .factor = .{ .w = 0 },
+        .rel_bias = 0,
+        .same_bias = 0,
+        .out_head = .{ .w = 0 },
+        .in_head = .{ .w = 0 },
+        .anchor_out_head = .{ .w = 0 },
+        .layers = try a.alloc(devicez.DeviceLayer, 1),
+        .arena = try cuda.DeviceBuffer.alloc(&drv, 16),
+    };
+    d.hw = try fullHostWeights(hw_arena.allocator()); // the uploads read real shape lengths
+    defer a.free(d.dhw.?.layers); // the cell's own rentals return with the test
+    defer d.dhw.?.arena.free();
+    const base = cuda.memory.usage(false);
+
+    Rec.reset();
+    Rec.fail_hto = 0; // the FIRST upload refuses: the carve is owned, the unwind must hand it back
+    const r = openz.stageDeviceScratch(&d);
+    try std.testing.expect(std.meta.isError(r));
+    try std.testing.expectEqual(@as(usize, 1), Rec.free_n); // the carve, freed exactly once
+    try std.testing.expectEqual(@as(usize, 0), Rec.host_free_n);
+    try std.testing.expect(d.ds.staged == false); // ask 3: a freed buf can never stay marked staged
+    try std.testing.expectEqual(base.device, cuda.memory.usage(false).device);
+}
+
+test "open paths: the real open() hands attachWeights an initialized open_stage (PR 5102 ask 3)" {
+    const a = std.testing.allocator;
+    var drv: cuda.Driver = undefined;
+    armDriver(&drv);
+    var e_dummy: lc.E = undefined;
+    const c: lc.Config = undefined; // init() dies at the checkpoint open before reading it
+    const d = try a.create(lc.Draft); // the REAL handover shape: create() = undefined fields
+    defer a.destroy(d);
+    d.ready = false; // the three writes real open() performs before attachWeights
+    d.ds = .{};
+    const base = cuda.memory.usage(false);
+
+    Rec.reset();
+    const w = try bodyWeights(&drv, a);
+    const r = openz.attachWeights(d, a, std.testing.io, &e_dummy, c, "/nonexistent/a-f3-no-such-dir", w);
+    try std.testing.expect(std.meta.isError(r));
+    try std.testing.expectEqual(@as(usize, 1), Rec.free_n); // the body-weights arena, once
+    try Rec.expectOnce(base);
+    if (d.open_stage != .none) @panic("open() must initialize open_stage before init()"); // undefined read REDs pre-cure
+}
+
 test "scorer result: a pair-alloc failure frees the first result allocation (owner A6)" {
     var wundef: head.Weights = undefined; // the injected stage fails before any weight is read
     const t = std.testing;
@@ -452,7 +520,6 @@ test "opt-in device scratch: a failed upload frees the carve once and unmarks it
     var hw_arena = std.heap.ArenaAllocator.init(a);
     defer hw_arena.deinit();
     const dhw = try dummyDeviceWeights(&drv, a);
-    defer a.free(dhw.layers); // the rig owns the dummy's layers slice
     Rec.reset();
     const base = cuda.memory.usage(false);
 
@@ -461,6 +528,8 @@ test "opt-in device scratch: a failed upload frees the carve once and unmarks it
     d.gpa = a;
     d.hw = try fullHostWeights(hw_arena.allocator());
     d.dhw = dhw;
+    defer a.free(d.dhw.?.layers); // the cell's own rentals return with the test
+    defer d.dhw.?.arena.free();
     Rec.fail_hto = 0; // the carve's first upload (the fused arm weights) refuses
     const r = openz.stageDeviceScratch(&d);
     try std.testing.expect(std.meta.isError(r));
@@ -484,12 +553,26 @@ test "fixture ladders free their host buffers on a mid-read failure (maintainer 
     try putBlob(io, a, &tmp, 56 * 1024 * 4, "out_normed.f32");
     try putBlob(io, a, &tmp, 56 * 1024 * 4, "h_pre.f32");
 
-    // every helper dies at its SECOND read with the FIRST buffer alive; the allocator leak check is the verdict.
+    // every helper dies at its SECOND read with the FIRST buffer alive; a retained blob fails the cell's leak audit
     try std.testing.expectError(error.FileNotFound, stagez.deviceTokenStatesAB(a, io, &d_dummy, root));
     try std.testing.expectError(error.FileNotFound, stagez.deviceLatticeAttentionAB(a, io, &d_dummy, root));
     try std.testing.expectError(error.FileNotFound, stagez.deviceFactorEdgeAB(a, io, &d_dummy, root));
     try std.testing.expectError(error.FileNotFound, stackz.deviceLayerStackAB(a, io, &d_dummy, root));
     try std.testing.expectError(error.FileNotFound, gatez.deviceFullChainAB(a, io, &d_dummy, root));
+}
+
+test "fixture reader: the full-size happy read leaves no host byte behind (maintainer ask 3)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const vals = [_]f32{ 1.5, -2.25, 3.0, 0.125, 4096.0, -0.5 };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "probe.f32", .data = std.mem.sliceAsBytes(&vals) });
+    const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(dir);
+    const got = try stackz.readFixtureF32(io, a, dir, "probe.f32", vals.len);
+    defer a.free(got);
+    try std.testing.expectEqualSlices(f32, &vals, got);
 }
 
 test "the open hand-over defines the staged mark; the carve windows unmark on unwind (maintainer ask 3, structural)" {

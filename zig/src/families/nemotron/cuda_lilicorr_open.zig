@@ -174,7 +174,7 @@ pub fn deinit(d: *Draft) void {
     d.token_states_buf.free();
     d.draft_picks_buf.free();
     if (d.ds.staged) d.ds.buf.free();
-    d.staged.free(); // maintainer ask 3: the pinned staging carve is owned from init()'s S2 block on - every close hands it back
+    d.staged.free(); // maintainer ask 3: the pinned staging carve rides the normal close too (owned from init)
     if (d.open_stage == .ring or d.open_stage == .ready) d.tap_ring.free(); // owned from .ring on: undefined below it
 
     // Unload modules
@@ -224,6 +224,7 @@ pub fn init(d: *Draft, gpa: std.mem.Allocator, io: std.Io, e: *E, c: Config, wei
     d.pool = .empty;
     d.head_loaded = false;
     d.head_arena = null;
+    d.open_stage = .none; // maintainer ask 3: open() defines it too — direct attachWeights callers read .none
     d.e = e;
     d.c = c;
     d.w = weights;
@@ -329,11 +330,11 @@ pub fn init(d: *Draft, gpa: std.mem.Allocator, io: std.Io, e: *E, c: Config, wei
         (env.path("TF_BODY_FIXTURE", env.rawText("TF_BODY_FIXTURE")) catch null) != null)
     {
         try stageDeviceScratch(d);
-        errdefer { // maintainer ask 3: after the carve returns, a later init() failure still hands the scratch back before .core owns it
-            d.ds.staged = false;
-            d.ds.buf.free();
-        }
     }
+    errdefer if (d.ds.staged) { // maintainer ask 3: a later init() failure hands the scratch back (deinit no-ops)
+        d.ds.staged = false;
+        d.ds.buf.free();
+    };
 
     // S2 A/B (env-gated): TF_LILICORR_FIXTURE=<dir> runs the device token projection against
 
@@ -477,7 +478,7 @@ pub fn stageDeviceScratch(d: *Draft) !void {
     var total: usize = 0;
     for (sizes) |z| total += (z + 255) / 256 * 256;
     d.ds.buf = try cuda.DeviceBuffer.alloc(d.e.ctx.d, total);
-    d.ds.staged = true; // maintainer ask 3: the flag holds exactly while the buffer is owned, so deinit's keyed free stays exact
+    d.ds.staged = true; // maintainer ask 3: the flag holds exactly while the buffer is owned
     errdefer { // maintainer ask 3: a failure below frees the carve AND unmarks it - the flag cannot outlive its buffer
         d.ds.staged = false;
         d.ds.buf.free();
