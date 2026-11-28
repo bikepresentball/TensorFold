@@ -144,6 +144,9 @@ const Rig = struct {
             .parallel_declared = false,
         };
         d.gpa = std.testing.allocator;
+        // production-state init (ask 8): open() starts pool/streams at .empty, not the rig's undefined
+        d.pool = .empty;
+        d.streams = .empty;
         d.tap_rows = 512;
         d.taps_in = 0x1a0000;
         d.th = 0x1b0000;

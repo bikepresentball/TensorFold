@@ -16,8 +16,10 @@ pub fn chunk(f: *const Forward, rows: usize, pos: usize) !void {
     for (0..f.w.blocks.len) |i| {
         try f.chunkPre(&w, i);
         try f.chunkMixer(&w, i);
-        if (f.unread and i == lastState(f.w.blocks)) return;
+        // the unread-output shortcut still runs chunkPost first: the taps write there (head/sample stay skipped)
+        const shortcut = f.unread and i == lastState(f.w.blocks);
         try f.chunkPost(&w, i);
+        if (shortcut) return;
     }
     try f.chunkFinish(&w);
 }
@@ -127,8 +129,12 @@ pub fn chunkPost(f: *const Forward, w: *Walk, i: usize) !void {
             w.delta = if (blk.moe.bolt != null) .dense else .moe;
         },
     }
-    // the drafter's taps: layer i's residual (x + this block's delta) into its ring slot.
+    try chunkTaps(f, w, i);
+}
 
+/// The drafter's taps after block i: layer i's residual (x + this block's delta) into its ring slot.
+pub fn chunkTaps(f: anytype, w: anytype, i: usize) !void {
+    const b = f.b;
     // setTaps admits a tap only where the delta is the bf16 plane (dense blocks; Bolt's MoE).
 
     // Write taps in the prompt path (chunk) like in windowRows (cuda_forward.zig ~276-280)
@@ -164,8 +170,11 @@ pub fn chunkPost(f: *const Forward, w: *Walk, i: usize) !void {
 
         //   rows = w.rows (total rows in chunk)
 
-        //   keep_rows = w.rows (KEEP ALL prompt rows - the drafter needs the full prompt)
-        try f.ops.draftTap(w.x, b.delta, f.tap_ring, meta_buffer, f.tap_rows, f.n_draft_taps, ti, 0, w.rows, w.rows, c.hidden);
+        //   keep_rows = @min(w.rows, f.tap_rows): a chunk wider than the ring writes its NEWEST
+
+        //   ring_rows rows only (tf_nem_tap's newest-rows retention, exactly the window path's face)
+
+        try f.ops.draftTap(w.x, b.delta, f.tap_ring, meta_buffer, f.tap_rows, f.n_draft_taps, ti, 0, w.rows, @min(w.rows, f.tap_rows), f.c.hidden);
     };
 }
 
